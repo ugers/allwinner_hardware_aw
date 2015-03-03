@@ -7,12 +7,13 @@ LOCAL_CFLAGS += -D__OS_ANDROID
 LOCAL_CFLAGS += -D__CHIP_VERSION_F23
 LOCAL_MODULE_TAGS := optional
 
-LOCAL_SRC_FILES:= omx_venc.cpp
+LOCAL_SRC_FILES:= neon_real_rgba2yuv420sp.s omx_venc.cpp
 
 LOCAL_C_INCLUDES := \
 	$(TOP)/hardware/aw/omxcore/inc/ \
 	$(TOP)/hardware/aw/venc \
 	$(TOP)/hardware/aw/vencode/h264encLib/include \
+	$(TOP)/frameworks/native/include/media/hardware \
 	$(TOP)/hardware/aw/include \
 	$(TOP)/hardware/aw \
 	$(CEDARX_TOP)/include/include_vencoder \
@@ -27,6 +28,9 @@ LOCAL_SHARED_LIBRARIES := \
 	libcedarxosal \
 	libaw_h264enc \
 	libcedarxbase \
+	libui \
+	libcedarxosal \
+	libion
 				
 
 LOCAL_MODULE:= libOmxVenc

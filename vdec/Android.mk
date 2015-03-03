@@ -16,9 +16,6 @@ LOCAL_C_INCLUDES := \
 	$(TOP)/hardware/aw \
 	$(TOP)/hardware/aw/include \
 
-
-#$(TOP)/frameworks/base/media/CedarX-Projects/CedarX/include/include_system/
-
 LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libutils \

@@ -259,6 +259,13 @@ void *thread_enc(void* data)
 		gBufMrgQ.read_id++;
 		gBufMrgQ.read_id %= ENC_FIFO_LEVEL;
 		pthread_mutex_unlock(&mtx_cam_buf);
+		if((int)encBuf.addrY >= 0x40000000) {
+			encBuf.addrY -= 0x40000000;
+		}
+		
+		if((int)encBuf.addrCb >= 0x40000000) {
+			encBuf.addrCb -= 0x40000000;
+		}
 
 		ret = m_encoder->encode(m_encoder, &encBuf);
 		
@@ -498,6 +505,8 @@ int main()
     	goto EXIT;
     }
 
+	// use yv12 format
+    m_decoder->ioctrl(m_decoder, CEDARV_COMMAND_SET_PIXEL_FORMAT, 1);
 
 	//* set video stream info.
 	memset(&stream_info, 0, sizeof(stream_info));

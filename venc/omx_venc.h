@@ -24,11 +24,25 @@
 #include "aw_omx_component.h"
 #include "H264encLibApi.h"
 #include "CDX_Resource_Manager.h"
+#include <ui/Rect.h>
+#include <ui/GraphicBufferMapper.h>
 
 extern "C"
 {
 	OMX_API void* get_omx_component_factory_fn(void);
 }
+
+typedef struct InputBufferInfo
+{
+	unsigned int size_Y;
+	unsigned int size_C;
+    unsigned char* pBufY;
+	unsigned char* pBufC;
+	unsigned char* phy_y;
+	unsigned char* phy_c;
+	unsigned char* buffer_point;
+	buffer_handle_t imgBuffer;
+}InputBufferInfo;
 
 /*
  * Enumeration for the commands processed by the component
@@ -56,7 +70,7 @@ typedef enum ThrCmdType
  */
 #define OMX_NOPORT                      0xFFFFFFFE
 #define NUM_IN_BUFFERS                  2        	// Input Buffers
-#define NUM_OUT_BUFFERS                 2       	// Output Buffers
+#define NUM_OUT_BUFFERS                 4       	// Output Buffers
 #define OMX_TIMEOUT                     10          // Timeout value in milisecond
 #define OMX_MAX_TIMEOUTS                160   		// Count of Maximum number of times the component can time out
 #define OMX_VIDEO_ENC_INPUT_BUFFER_SIZE (128*1024)
@@ -252,6 +266,7 @@ public:
     BufferList                      m_sOutBufList;
     pthread_mutex_t					m_inBufMutex;
     pthread_mutex_t                 m_outBufMutex;
+	pthread_mutex_t                 m_bitrateMutex;
 
     //* for cedarv encoder.
 	VENC_DEVICE *					m_encoder;
@@ -262,9 +277,16 @@ public:
 	OMX_U32                         m_extraDataLength;
 	OMX_BOOL                        m_firstFrameFlag;
 	ve_mutex_t 						m_cedarv_req_ctx;
-    //CEDARV_REQUEST_CONTEXT          m2_cedarv_req_ctx;    //ignore
 	OMX_S32                         m_input_step;
 	OMX_U32                         m_framerate;
+	OMX_BOOL 						m_useMetaDataInBuffers;
+	OMX_BOOL						m_prependSPSPPSToIDRFrames;
+	OMX_COLOR_FORMATTYPE 			m_inputcolorFormats[2];
+	OMX_U8*                         m_input_buffer_vir;
+	OMX_U8*                         m_input_buffer_phy;
+	InputBufferInfo                 m_input_buffer_info;
+	char                            mCallingProcess[256];  //add by fuqiang for cts
+	bool                            mIsFromCts;   //add by fuqiang for cts
 };
 
 #endif // __OMX_VENC_H__

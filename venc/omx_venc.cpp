@@ -18,18 +18,29 @@
 #include <utils/Log.h>
 #include "AWOmxDebug.h"
 
+#include <binder/IPCThreadState.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <errno.h>
 #include <sys/time.h>
 #include "omx_venc.h"
 #include <fcntl.h>
-#include "AWOMX_VideoIndexExtension.h"
 #include <utils/CallStack.h>
+#include <linux/ion.h>
+#include <ion/ion.h>
+#include "gralloc_priv.h"
+#include <HardwareAPI.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 using namespace android;
+
+#define SAVE_FILE 0
 
 #define DEFAULT_BITRATE 1024*1024*2
 
@@ -44,6 +55,22 @@ VIDEO_PROFILE_LEVEL_TYPE SupportedH263ProfileLevels[] = {
   {OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level60},
   {OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level70},
   {-1, -1}};
+
+
+/* AVC Supported Levels & profiles  for a33 cts*/
+VIDEO_PROFILE_LEVEL_TYPE CTSSupportedAVCProfileLevels[] ={
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1b},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel11},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel12},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel13},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel2},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel21},
+   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel22},
+   {-1,-1}
+};
+
+
 /* AVC Supported Levels & profiles */
 VIDEO_PROFILE_LEVEL_TYPE SupportedAVCProfileLevels[] ={
   {OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1},
@@ -82,6 +109,8 @@ VIDEO_PROFILE_LEVEL_TYPE SupportedAVCProfileLevels[] ={
 typedef enum VIDENC_CUSTOM_INDEX
 {
     VideoEncodeCustomParamStoreMetaDataInBuffers = OMX_IndexVendorStartUnused,
+	VideoEncodeCustomParamPrependSPSPPSToIDRFrames,
+	VideoEncodeCustomParamEnableAndroidNativeBuffers
 } VIDENC_CUSTOM_INDEX;
 
 typedef enum ENC_INPUT_STEP
@@ -93,7 +122,9 @@ typedef enum ENC_INPUT_STEP
 
 static VIDDEC_CUSTOM_PARAM sVideoEncCustomParams[] =
 {
-	{"OMX.google.android.index.storeMetaDataInBuffers", (OMX_INDEXTYPE)VideoEncodeCustomParamStoreMetaDataInBuffers}
+	{"OMX.google.android.index.storeMetaDataInBuffers", (OMX_INDEXTYPE)VideoEncodeCustomParamStoreMetaDataInBuffers},
+	{"OMX.google.android.index.prependSPSPPSToIDRFrames",(OMX_INDEXTYPE)VideoEncodeCustomParamPrependSPSPPSToIDRFrames},
+	{"OMX.google.android.index.enableAndroidNativeBuffers", (OMX_INDEXTYPE)VideoEncodeCustomParamEnableAndroidNativeBuffers}
 };
 
 typedef struct OMX_VIDEO_STOREMETADATAINBUFFERSPARAMS {
@@ -110,8 +141,190 @@ typedef struct ENCEXTRADATAINFO_t //don't touch it, because it also defined in t
 	int length;
 }ENCEXTRADATAINFO_t;
 
+extern "C" void cedarx_cache_op(long start, long end, int flag);
+extern "C" void *cedar_sys_phymalloc_map(unsigned int size, int align);
+extern "C" void cedar_sys_phyfree_map(void *buf);
+extern "C" unsigned int cedarv_address_vir2phy(void *addr);
+
 static void* ComponentThread(void* pThreadData);
 
+#define BT601_C0 0.257
+#define BT601_C1 0.504
+#define BT601_C2 0.098
+#define BT601_C3 0.148
+#define BT601_C4 0.291
+#define BT601_C5 0.439
+#define BT601_C6 0.439
+#define BT601_C7 0.368
+#define BT601_C8 0.071
+#define C9 16
+
+#define BT709_C0 0.183
+#define BT709_C1 0.614
+#define BT709_C2 0.062
+#define BT709_C3 0.101
+#define BT709_C4 0.338
+#define BT709_C5 0.439
+#define BT709_C6 0.439
+#define BT709_C7 0.399
+#define BT709_C8 0.040
+
+
+typedef struct RGBPIX
+{
+	//unsigned char a;
+	unsigned char r;
+	unsigned char g;
+	unsigned char b;
+	unsigned char a;
+}RGBPIX;
+
+
+/*	rgb_pix is pointed to raw_rgb_buffer; 
+	yuv_pix need to be allocated with size 3*width*height, it can be used for encoder's inputBuffer;
+	yuv_downsample need to be allocated with size width*height,it is only used to down_sample;
+	3 steps:first RGBA to YUV444;	second YUV444 to YUV420;	third YUV420(Y Plane,U Plane,V Plane) to YUV420(Y Plane,UV Plane) */
+void rgb2yuv_fixpoint(RGBPIX *rgb_pix, unsigned char *yuv_pix,unsigned char *yuv_downsample,int width,int height,int stride,int mode)
+{
+//	ALOGV("first: RGBA to YUV444");
+	unsigned char *Y = yuv_pix;
+	int size   = width*height;
+	unsigned char *U = yuv_pix + size;
+	unsigned char *V = yuv_pix + size*2;
+	unsigned char *ptrSrc,*ptrDst,*ptr_uv;
+	int		width_delta;
+	int     y,u,v;
+	int		i,j,size_uv;
+	int     coef[9];
+	int     FixBits = 10;
+	int     FixBits1 = FixBits + 1;
+	//printf("the mode is %d\n",mode);
+
+	width_delta = stride - width;
+
+	if(mode == 0)
+	{
+		coef[0] = (int)(BT601_C0*(1<<FixBits1)+1)>>1;
+		coef[1] = (int)(BT601_C1*(1<<FixBits1)+1)>>1;
+		coef[2] = (int)(BT601_C2*(1<<FixBits1)+1)>>1;
+		coef[3] = (int)(BT601_C3*(1<<FixBits1)+1)>>1;
+		coef[4] = (int)(BT601_C4*(1<<FixBits1)+1)>>1;
+		coef[5] = (int)(BT601_C5*(1<<FixBits1)+1)>>1;
+		coef[6] = (int)(BT601_C6*(1<<FixBits1)+1)>>1;
+		coef[7] = (int)(BT601_C7*(1<<FixBits1)+1)>>1;
+		coef[8] = (int)(BT601_C8*(1<<FixBits1)+1)>>1;
+	}
+
+	else if (mode == 1)//MPEG4
+		{
+			coef[0] = (int)(BT709_C0*(1<<FixBits1)+1)>>1;
+			coef[1] = (int)(BT709_C1*(1<<FixBits1)+1)>>1;
+			coef[2] = (int)(BT709_C2*(1<<FixBits1)+1)>>1;
+			coef[3] = (int)(BT709_C3*(1<<FixBits1)+1)>>1;
+			coef[4] = (int)(BT709_C4*(1<<FixBits1)+1)>>1;
+			coef[5] = (int)(BT709_C5*(1<<FixBits1)+1)>>1;
+			coef[6] = (int)(BT709_C6*(1<<FixBits1)+1)>>1;
+			coef[7] = (int)(BT709_C7*(1<<FixBits1)+1)>>1;
+			coef[8] = (int)(BT709_C8*(1<<FixBits1)+1)>>1;
+		}
+
+
+	for(i=0;i<height;i++)
+	{
+		for(j=0;j<width;j++)
+		{
+			y = ((coef[0]*rgb_pix->r>>6) + (coef[1]*rgb_pix->g>>6) + (coef[2]*rgb_pix->b>>6) + (C9<<4))>>4;
+			*Y = y>255 ? 255 : (y<0 ? 0 : y);
+			u = (-(coef[3]*rgb_pix->r>>6) - (coef[4]*rgb_pix->g>>6) + (coef[5]*rgb_pix->b>>6) + (128<<4))>>4;
+			*U++ = u>255 ? 255 : (u<0 ? 0 : u);
+			v = ((coef[6]*rgb_pix->r>>6) - (coef[7]*rgb_pix->g>>6) - (coef[8]*rgb_pix->b>>6)+ (128<<4))>>4;
+			*V++ = v>255 ? 255 : (v<0 ? 0 : v);
+			rgb_pix++;
+			Y++;
+		}
+		rgb_pix += width_delta;
+	}
+
+//	ALOGV("second: YUV444 to YUV420");
+	ptrSrc = yuv_pix + size;
+	ptrDst = yuv_downsample;
+
+	if (mode < 2)//yuv 444 to 420
+	{
+		size_uv = size>>2;
+		for(i=0;i<height*2;i++)
+		{
+			for(j=0;j<width;j++)
+			{
+				if(((i&1) | (j&1)) == 0)
+					*ptrDst++ = (*(ptrSrc)+*(ptrSrc+1)+*(ptrSrc+width)+*(ptrSrc+width+1)+2)>>2;
+				ptrSrc++;
+			}
+		}
+	}
+	else//yuv 444 to 422
+	{
+		size_uv = size>>1;
+		for(i=0;i<height*2;i++)
+		{
+			for(j=0;j<width;j++)
+			{
+				if((j&1) == 0)
+					*ptrDst++ = (*(ptrSrc)+*(ptrSrc+1)+1)>>1;
+				ptrSrc++;
+			}
+		}
+	}
+
+//	ALOGV("third: YUV420(Y Plane,U Plane,V Plane) to YUV420(Y Plane,UV Plane)");
+	ptrSrc = yuv_pix + size;
+	ptrDst = yuv_downsample;
+	#if 1
+	for(i = 0;i<size_uv;i++)
+	{
+		*ptrSrc++ = *ptrDst;
+		*ptrSrc++ = *(ptrDst + size_uv);
+		ptrDst++;
+	}
+	#else
+	memcpy(ptrSrc,ptrDst,size_uv*2);
+	#endif
+}
+
+#define _cplusplus
+#ifdef _cplusplus
+	extern "C" void Img_real_RGBA2YUV420SP_neon(unsigned char *pu8RgbBuffer, unsigned char *pu8SrcYUV, int *l32Width_stride, int l32Height);;
+#else
+	extern  void Img_real_RGBA2YUV420SP_neon(unsigned char *pu8RgbBuffer, unsigned char *pu8SrcYUV, int *l32Width_stride, int l32Height);;
+#endif
+
+#define GET_CALLING_PID	(IPCThreadState::self()->getCallingPid())
+void getCallingProcessName(char *name)
+{
+	char proc_node[128];
+
+	if (name == 0)
+	{
+		ALOGE("error in params");
+		return;
+	}
+
+	memset(proc_node, 0, sizeof(proc_node));
+	sprintf(proc_node, "/proc/%d/cmdline", GET_CALLING_PID);
+	int fp = ::open(proc_node, O_RDONLY);
+	if (fp > 0)
+	{
+		memset(name, 0, 128);
+		::read(fp, name, 128);
+		::close(fp);
+		fp = 0;
+		ALOGD("Calling process 2 is: %s", name);
+	}
+	else
+	{
+		ALOGE("Obtain calling process failed");
+	}
+}
 //* factory function executed by the core to create instances
 void *get_omx_component_factory_fn(void)
 {
@@ -124,7 +337,7 @@ static VENC_DEVICE * CedarvEncInit(unsigned int width, unsigned int height, unsi
 	int ret = -1;
 
 	VENC_DEVICE *pCedarV = NULL;
-	
+
 	pCedarV = H264EncInit(&ret);
 	if (ret < 0)
 	{
@@ -132,6 +345,8 @@ static VENC_DEVICE * CedarvEncInit(unsigned int width, unsigned int height, unsi
 	}
 
 	__video_encode_format_t enc_fmt;
+	memset(&enc_fmt, 0, sizeof(__video_encode_format_t));
+
 	enc_fmt.src_width = width;
 	enc_fmt.src_height = height;
 	enc_fmt.width = width;
@@ -142,7 +357,7 @@ static VENC_DEVICE * CedarvEncInit(unsigned int width, unsigned int height, unsi
 	enc_fmt.qp_max = 40;
 	enc_fmt.qp_min = 20;
 	enc_fmt.avg_bit_rate = avg_bit_rate;
-	
+
 	enc_fmt.maxKeyInterval = 25;
 
     //enc_fmt.profileIdc = 77; /* main profile */
@@ -187,8 +402,14 @@ omx_venc::omx_venc()
 	m_cmddatapipe[1]     = 0;
 	m_pExtraData         = NULL;
 	m_extraDataLength    = 0;
-	m_firstFrameFlag     = OMX_FALSE;
+	m_firstFrameFlag     = OMX_FALSE;
 	m_framerate          = 25;
+	mIsFromCts           = false;
+	getCallingProcessName(mCallingProcess);
+	if((strcmp(mCallingProcess, "com.android.cts.media") == 0) || (strcmp(mCallingProcess, "com.android.cts.videoperf") == 0) || (strcmp(mCallingProcess, "com.android.pts.videoperf") == 0))
+	{
+		mIsFromCts           = true;
+	}
 
 	m_encoder = NULL;
 
@@ -202,9 +423,11 @@ omx_venc::omx_venc()
 	memset(&m_sOutBufSupplier, 0, sizeof(m_sOutBufSupplier));
 	memset(&m_sInBufList, 0, sizeof(m_sInBufList));
 	memset(&m_sOutBufList, 0, sizeof(m_sOutBufList));
+	memset(&m_input_buffer_info, 0, sizeof(InputBufferInfo));
 
 	pthread_mutex_init(&m_inBufMutex, NULL);
 	pthread_mutex_init(&m_outBufMutex, NULL);
+	pthread_mutex_init(&m_bitrateMutex, NULL);
 
     ALOGV("omx_enc Create!");
 }
@@ -282,8 +505,9 @@ omx_venc::~omx_venc()
 
     pthread_mutex_destroy(&m_inBufMutex);
     pthread_mutex_destroy(&m_outBufMutex);
+	pthread_mutex_destroy(&m_bitrateMutex);
 
-    ALOGV("~omx_dec done!");
+    ALOGV("~omx_enc done!");
 }
 
 OMX_ERRORTYPE omx_venc::component_init(OMX_STRING name)
@@ -295,7 +519,7 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING name)
 	ALOGV(" COMPONENT_INIT, name = %s", name);
 
 	strncpy((char*)m_cName, name, OMX_MAX_STRINGNAME_SIZE);
-	
+
 	if(!strncmp((char*)m_cName, "OMX.allwinner.video.encoder.avc", OMX_MAX_STRINGNAME_SIZE))
 	{
 		strncpy((char*)m_cRole, "video_encoder.avc", OMX_MAX_STRINGNAME_SIZE);
@@ -357,8 +581,11 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING name)
     // Initialize the video compression format for input port
     OMX_CONF_INIT_STRUCT_PTR(&m_sInPortFormat, OMX_VIDEO_PARAM_PORTFORMATTYPE);
     m_sInPortFormat.nPortIndex         = 0x0;
-    m_sInPortFormat.nIndex             = 0x0;
+    m_sInPortFormat.nIndex             = 0x1;
 	m_sInPortFormat.eColorFormat 	   = OMX_COLOR_FormatYUV420SemiPlanar; //fix it later
+
+	m_inputcolorFormats[0] = OMX_COLOR_FormatYUV420SemiPlanar;
+	m_inputcolorFormats[1] = OMX_COLOR_FormatAndroidOpaque;
 
     // Initialize the compression format for output port
     OMX_CONF_INIT_STRUCT_PTR(&m_sOutPortFormat, OMX_VIDEO_PARAM_PORTFORMATTYPE);
@@ -479,7 +706,6 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING name)
 		eRet = OMX_ErrorInsufficientResources;
         goto EXIT;
 	}
-//	}
 
     // Create the pipe used to send commands to the thread
     err = pipe(m_cmdpipe);
@@ -504,6 +730,13 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING name)
     	eRet = OMX_ErrorInsufficientResources;
         goto EXIT;
     }
+
+	// init some param
+	m_useAndroidBuffer = OMX_FALSE;
+	m_useMetaDataInBuffers = OMX_FALSE;
+	m_prependSPSPPSToIDRFrames = OMX_FALSE;
+	m_input_buffer_vir = NULL;
+	m_input_buffer_phy = NULL;
 
 EXIT:
     return eRet;
@@ -633,7 +866,7 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
     	ALOGV("Get Param in Invalid paramData \n");
         return OMX_ErrorBadParameter;
     }
-    
+
     switch(paramIndex)
     {
     	case OMX_IndexParamVideoInit:
@@ -665,19 +898,30 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
     	case OMX_IndexParamVideoPortFormat:
     	{
     		ALOGV(" COMPONENT_GET_PARAMETER: OMX_IndexParamVideoPortFormat");
- 	        if (((OMX_VIDEO_PARAM_PORTFORMATTYPE *)(paramData))->nPortIndex == m_sInPortFormat.nPortIndex)
+
+			OMX_VIDEO_PARAM_PORTFORMATTYPE * param_portformat_type = (OMX_VIDEO_PARAM_PORTFORMATTYPE *)(paramData);
+ 	        if (param_portformat_type->nPortIndex == m_sInPortFormat.nPortIndex)
  	        {
- 	            if (((OMX_VIDEO_PARAM_PORTFORMATTYPE*)(paramData))->nIndex > m_sInPortFormat.nIndex)
-		            eError = OMX_ErrorNoMore;
+ 	            if (param_portformat_type->nIndex > m_sInPortFormat.nIndex)
+ 	            {
+		           	eError = OMX_ErrorNoMore;
+ 	            }
 		        else
-		            memcpy(paramData, &m_sInPortFormat, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
+		        {
+	        		param_portformat_type->eCompressionFormat = (OMX_VIDEO_CODINGTYPE)0;
+	        		param_portformat_type->eColorFormat = m_inputcolorFormats[param_portformat_type->nIndex];
+		        }
 		    }
 	        else if (((OMX_VIDEO_PARAM_PORTFORMATTYPE*)(paramData))->nPortIndex == m_sOutPortFormat.nPortIndex)
 	        {
 	            if (((OMX_VIDEO_PARAM_PORTFORMATTYPE*)(paramData))->nIndex > m_sOutPortFormat.nIndex)
+	            {
 		            eError = OMX_ErrorNoMore;
+	            }
 		        else
+		        {
 		            memcpy(paramData, &m_sOutPortFormat, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
+		        }
 		    }
 		    else
 		        eError = OMX_ErrorBadPortIndex;
@@ -725,7 +969,7 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
 
     		break;
     	}
-		
+
         case OMX_IndexParamVideoBitrate:
 		{
 			ALOGV(" COMPONENT_GET_PARAMETER: OMX_IndexParamVideoBitrate");
@@ -737,14 +981,14 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
             {
                 eError = OMX_ErrorBadPortIndex;
             }
-            break;			
+            break;
 		}
 
 	    case OMX_IndexParamVideoAvc:
 	    {
 	    	ALOGV(" COMPONENT_GET_PARAMETER: OMX_IndexParamVideoAvc");
             OMX_VIDEO_PARAM_AVCTYPE* pComponentParam = (OMX_VIDEO_PARAM_AVCTYPE*)paramData;
-			
+
             if (pComponentParam->nPortIndex == m_sH264Type.nPortIndex)
             {
                 memcpy(pComponentParam, &m_sH264Type, sizeof(OMX_VIDEO_PARAM_AVCTYPE));
@@ -823,14 +1067,21 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
         	{
 
         	case OMX_VIDEO_CodingAVC:
-        		pProfileLevel = SupportedAVCProfileLevels;
-        		nNumberOfProfiles = sizeof(SupportedAVCProfileLevels) / sizeof (VIDEO_PROFILE_LEVEL_TYPE);
+        		if(mIsFromCts == true){
+        			pProfileLevel = CTSSupportedAVCProfileLevels;
+        			nNumberOfProfiles = sizeof(CTSSupportedAVCProfileLevels) / sizeof (VIDEO_PROFILE_LEVEL_TYPE);
+        		}else{
+        			pProfileLevel = SupportedAVCProfileLevels;
+        			nNumberOfProfiles = sizeof(SupportedAVCProfileLevels) / sizeof (VIDEO_PROFILE_LEVEL_TYPE);
+
+        		}
         		break;
 
         	case OMX_VIDEO_CodingH263:
         		pProfileLevel = SupportedH263ProfileLevels;
         		nNumberOfProfiles = sizeof(SupportedH263ProfileLevels) / sizeof (VIDEO_PROFILE_LEVEL_TYPE);
         		break;
+
         	default:
         		return OMX_ErrorBadParameter;
         	}
@@ -852,28 +1103,19 @@ OMX_ERRORTYPE  omx_venc::get_parameter(OMX_IN OMX_HANDLETYPE hComp,
         	{
         		eError = OMX_ErrorNoMore;
         	}
-			
+
         	break;
         }
     	default:
     	{
-    		if((AW_VIDEO_EXTENSIONS_INDEXTYPE)paramIndex == AWOMX_IndexParamVideoGetAndroidNativeBufferUsage)
-    		{
-        		ALOGV(" COMPONENT_GET_PARAMETER: AWOMX_IndexParamVideoGetAndroidNativeBufferUsage");
-                break;
-    		}
-    		else
-    		{
-        		ALOGV("get_parameter: unknown param %08x\n", paramIndex);
-        		eError =OMX_ErrorUnsupportedIndex;
-        		break;
-    		}
+    		ALOGE("get_parameter: unknown param %08x\n", paramIndex);
+    		eError =OMX_ErrorUnsupportedIndex;
+    		break;
     	}
     }
 
     return eError;
 }
-
 
 
 OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_INDEXTYPE paramIndex,  OMX_IN OMX_PTR paramData)
@@ -900,7 +1142,7 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
 	    case OMX_IndexParamPortDefinition:
 	    {
 	    	ALOGV(" COMPONENT_SET_PARAMETER: OMX_IndexParamPortDefinition");
-			
+
             if (((OMX_PARAM_PORTDEFINITIONTYPE *)(paramData))->nPortIndex == m_sInPortDef.nPortIndex)
             {
             	ALOGV("in, nPortIndex: %d", ((OMX_PARAM_PORTDEFINITIONTYPE *)(paramData))->nBufferCountActual);
@@ -989,7 +1231,7 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
 	            m_sOutPortDef.format.video.nStride = m_sOutPortDef.format.video.nFrameWidth;
 
  				m_framerate = (m_sInPortDef.format.video.xFramerate >> 16);
-				
+
 				ALOGV("m_framerate: %d", (int)m_framerate);
 	        }
 	        else
@@ -1006,14 +1248,19 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
 	        if(1 == portFmt->nPortIndex)
 	        	m_color_format = portFmt->eColorFormat;
 #else
-
-	        if (((OMX_VIDEO_PARAM_PORTFORMATTYPE *)(paramData))->nPortIndex == m_sInPortFormat.nPortIndex)
-	        {
-	            if (((OMX_VIDEO_PARAM_PORTFORMATTYPE *)(paramData))->nIndex > m_sInPortFormat.nIndex)
-		            eError = OMX_ErrorNoMore;
+			OMX_VIDEO_PARAM_PORTFORMATTYPE * param_portformat_type = (OMX_VIDEO_PARAM_PORTFORMATTYPE *)(paramData);
+ 	        if (param_portformat_type->nPortIndex == m_sInPortFormat.nPortIndex)
+ 	        {
+ 	            if (param_portformat_type->nIndex > m_sInPortFormat.nIndex)
+ 	            {
+		           	eError = OMX_ErrorNoMore;
+ 	            }
 		        else
-		            memcpy(&m_sInPortFormat, paramData, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
-	        }
+	        	{
+					m_sInPortFormat.eColorFormat = param_portformat_type->eColorFormat;
+					m_sInPortDef.format.video.eColorFormat = m_sInPortFormat.eColorFormat;
+	        	}
+		    }
 	        else if (((OMX_VIDEO_PARAM_PORTFORMATTYPE*)(paramData))->nPortIndex == m_sOutPortFormat.nPortIndex)
 	        {
 	            if (((OMX_VIDEO_PARAM_PORTFORMATTYPE*)(paramData))->nIndex > m_sOutPortFormat.nIndex)
@@ -1097,21 +1344,23 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
 
         	break;
 	    }
-		
+
         case OMX_IndexParamVideoBitrate:
         {
-			ALOGV(" COMPONENT_SET_PARAMETER: OMX_IndexParamVideoBitrate"); 
+			ALOGV(" COMPONENT_SET_PARAMETER: OMX_IndexParamVideoBitrate");
             OMX_VIDEO_PARAM_BITRATETYPE* pComponentParam = (OMX_VIDEO_PARAM_BITRATETYPE*)paramData;
             if (pComponentParam->nPortIndex == m_sOutPutBitRateType.nPortIndex)
             {
+            	pthread_mutex_lock(&m_bitrateMutex);
                 memcpy(&m_sOutPutBitRateType,pComponentParam, sizeof(OMX_VIDEO_PARAM_BITRATETYPE));
 
                 if(!m_sOutPutBitRateType.nTargetBitrate)
                 {
                     m_sOutPutBitRateType.nTargetBitrate = DEFAULT_BITRATE;
                 }
-				
+
                 m_sOutPortDef.format.video.nBitrate = m_sOutPutBitRateType.nTargetBitrate;
+				pthread_mutex_unlock(&m_bitrateMutex);
             }
             else
             {
@@ -1124,7 +1373,7 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
 	    {
 	    	ALOGV(" COMPONENT_SET_PARAMETER: OMX_IndexParamVideoAvc");
             OMX_VIDEO_PARAM_AVCTYPE* pComponentParam = (OMX_VIDEO_PARAM_AVCTYPE*)paramData;
-			
+
             if (pComponentParam->nPortIndex == m_sH264Type.nPortIndex)
             {
                 memcpy(&m_sH264Type,pComponentParam, sizeof(OMX_VIDEO_PARAM_AVCTYPE));
@@ -1152,33 +1401,69 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE hComp, OMX_IN OMX_I
      		ALOGV("set_parameter: OMX_IndexParamVideoMpeg4, do nothing.\n");
 	    	break;
 	    }
-
-		case VideoEncodeCustomParamStoreMetaDataInBuffers: //fixed if later
+		case OMX_IndexParamVideoIntraRefresh:
 		{
-	    	ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamStoreMetaDataInBuffers");
-	    	break;			
+	    	ALOGD(" COMPONENT_SET_PARAMETER: OMX_IndexParamVideoIntraRefresh , can't set curently"); //fixed if later
+	    	break;
 		}
+
 	    default:
-	    {
-	    	if((AW_VIDEO_EXTENSIONS_INDEXTYPE)paramIndex == AWOMX_IndexParamVideoUseAndroidNativeBuffer2)
+	    {   switch((VIDENC_CUSTOM_INDEX)paramIndex)
 	    	{
-		    	ALOGV(" COMPONENT_SET_PARAMETER: AWOMX_IndexParamVideoUseAndroidNativeBuffer2");
-	     		ALOGV("set_parameter: AWOMX_IndexParamVideoUseAndroidNativeBuffer2, do nothing.\n");
-	     		m_useAndroidBuffer = OMX_TRUE;
-		    	break;
-	    	}
-	    	else if((AW_VIDEO_EXTENSIONS_INDEXTYPE)paramIndex == AWOMX_IndexParamVideoEnableAndroidNativeBuffers)
-	    	{
-		    	ALOGV(" COMPONENT_SET_PARAMETER: AWOMX_IndexParamVideoEnableAndroidNativeBuffers");
-	     		ALOGV("set_parameter: AWOMX_IndexParamVideoEnableAndroidNativeBuffers, do nothing.\n");
-	     		m_useAndroidBuffer = OMX_TRUE;
-		    	break;
-	    	}
-	    	else
-	    	{
-	    		ALOGV("Setparameter: unknown param %d\n", paramIndex);
-	    		eError = OMX_ErrorUnsupportedIndex;
-	    		break;
+	    		case VideoEncodeCustomParamStoreMetaDataInBuffers:
+				{
+					if(mIsFromCts == false)
+					{
+						m_useMetaDataInBuffers = OMX_TRUE;
+				    	ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamStoreMetaDataInBuffers");
+					}
+					else
+					{
+						m_useMetaDataInBuffers = ((StoreMetaDataInBuffersParams*)paramData)->bStoreMetaData;
+				    	ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamStoreMetaDataInBuffers %d",
+				    			m_useMetaDataInBuffers);
+					}
+			    	break;
+				}
+
+				case VideoEncodeCustomParamPrependSPSPPSToIDRFrames:
+				{
+					if(mIsFromCts == false)
+					{
+						m_prependSPSPPSToIDRFrames = OMX_TRUE;
+						ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamPrependSPSPPSToIDRFrames");
+					}
+					else
+					{
+						m_prependSPSPPSToIDRFrames = ((PrependSPSPPSToIDRFramesParams*)paramData)->bEnable;
+						ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamPrependSPSPPSToIDRFrames %d",
+								m_prependSPSPPSToIDRFrames);
+					}
+			    	break;
+				}
+
+				case VideoEncodeCustomParamEnableAndroidNativeBuffers:
+				{
+					if(mIsFromCts == false)
+					{
+						ALOGV(" COMPONENT_SET_PARAMETER: VideoEncodeCustomParamStoreMetaDataInBuffers");
+						m_useAndroidBuffer = OMX_TRUE;
+					}
+					else
+					{
+						ALOGV(" COMPONENT_SET_PARAMETER: 2 VideoEncodeCustomParamEnableAndroidNativeBuffers paramPort %d , enable :%d ",
+								((EnableAndroidNativeBuffersParams*)paramData)->nPortIndex ,((EnableAndroidNativeBuffersParams*)paramData)->enable);
+						if(((EnableAndroidNativeBuffersParams*)paramData)->nPortIndex == 0)    //* input port
+							m_useAndroidBuffer = ((EnableAndroidNativeBuffersParams*)paramData)->enable;
+					}
+			    	break;
+				}
+			    default:
+				{
+				    ALOGE("Setparameter: unknown param %x\n", paramIndex);
+		    		eError = OMX_ErrorUnsupportedIndex;
+		    		break;
+		    	}
 	    	}
 	    }
     }
@@ -1369,7 +1654,7 @@ OMX_ERRORTYPE  omx_venc::use_buffer(OMX_IN    OMX_HANDLETYPE          hComponent
 //        android::CallStack stack;
 //        stack.update(1, 100);
 //        stack.dump("use_buffer_outPort");
-    
+
     	if((int)m_sOutBufList.nAllocSize >= m_sOutBufList.nBufArrSize)
         {
         	pthread_mutex_unlock(&m_outBufMutex);
@@ -1542,7 +1827,7 @@ OMX_ERRORTYPE omx_venc::free_buffer(OMX_IN  OMX_HANDLETYPE        hComponent,
 //        android::CallStack stack;
 //        stack.update(1, 100);
 //        stack.dump("free_buffer_outPort");
-    
+
     	for(nIndex = 0; nIndex < m_sInBufList.nBufArrSize; nIndex++)
     	{
     		if(pBufferHdr == &m_sInBufList.pBufArr[nIndex])
@@ -1577,7 +1862,7 @@ OMX_ERRORTYPE omx_venc::free_buffer(OMX_IN  OMX_HANDLETYPE        hComponent,
 //        android::CallStack stack;
 //        stack.update(1, 100);
 //        stack.dump("free_buffer_outPort");
-    
+
     	for(nIndex = 0; nIndex < m_sOutBufList.nBufArrSize; nIndex++)
     	{
     		ALOGV("pBufferHdr = %x, &m_sOutBufList.pBufArr[%d] = %x", pBufferHdr, nIndex, &m_sOutBufList.pBufArr[nIndex]);
@@ -1624,7 +1909,7 @@ OMX_ERRORTYPE  omx_venc::empty_this_buffer(OMX_IN OMX_HANDLETYPE hComponent, OMX
 //    android::CallStack stack;
 //    stack.update(1, 100);
 //    stack.dump("empty_this_buffer_outPort");
-    
+
     if(hComponent == NULL || pBufferHdr == NULL)
     	return OMX_ErrorBadParameter;
 
@@ -1706,7 +1991,7 @@ OMX_ERRORTYPE  omx_venc::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
     OMX_S32       nIndex = 0;
 
 	ALOGD("component_deinit before");
-	
+
     // In case the client crashes, check for nAllocSize parameter.
     // If this is greater than zero, there are elements in the list that are not free'd.
     // In that case, free the elements.
@@ -1776,7 +2061,13 @@ OMX_ERRORTYPE  omx_venc::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
 		CedarvEncExit(m_encoder);
 		m_encoder = NULL;
 	}
-	
+
+	if(m_input_buffer_vir != NULL)
+	{
+		cedar_sys_phyfree_map(m_input_buffer_vir);
+		m_input_buffer_vir = NULL;
+	}
+
 	ve_mutex_destroy(&m_cedarv_req_ctx);
 
     return eError;
@@ -1850,7 +2141,7 @@ static void* ComponentThread(void* pThreadData)
     // Variables related to encoder timeouts
     OMX_U32                 nTimeout;
     OMX_BOOL                port_setting_match;
-    OMX_BOOL                eos;
+    OMX_BOOL                nInBufEos;
 
     OMX_PTR                 pMarkData;
     OMX_HANDLETYPE          hMarkTargetComponent;
@@ -1858,12 +2149,18 @@ static void* ComponentThread(void* pThreadData)
     struct timeval          timeout;
 
     port_setting_match   = OMX_TRUE;
-    eos                  = OMX_FALSE;
+    nInBufEos            = OMX_FALSE;
     pMarkData            = NULL;
     hMarkTargetComponent = NULL;
 
     // Recover the pointer to my component specific data
     omx_venc* pSelf = (omx_venc*)pThreadData;
+
+#if SAVE_FILE
+	FILE* fpInput = fopen("/data/camera/encoderInput.dat", "wb");
+	FILE* fpOutput = fopen("/data/camera/encoderOutput.dat", "wb");
+	FILE* rgb = fopen("/data/camera/rgb.dat", "wb");
+#endif
 
     while (1)
     {
@@ -1954,6 +2251,8 @@ static void* ComponentThread(void* pThreadData)
 			                    // Return buffers if currently in pause and executing
 			                    if (pSelf->m_state == OMX_StatePause || pSelf->m_state == OMX_StateExecuting)
 			                    {
+			                    	ALOGV("pSelf->m_state %d", pSelf->m_state);
+
 			                    	pthread_mutex_lock(&pSelf->m_inBufMutex);
 
                                     while (pSelf->m_sInBufList.nSizeOfList > 0)
@@ -1995,9 +2294,9 @@ static void* ComponentThread(void* pThreadData)
 										ENCEXTRADATAINFO_t sps_pps_info;
 										unsigned int level = 31;
 
-										switch(pSelf->m_sH264Type.eLevel) 
+										switch(pSelf->m_sH264Type.eLevel)
 										{
-											case OMX_VIDEO_AVCLevel31: 
+											case OMX_VIDEO_AVCLevel31:
 												level = 31;
 												break;
 											case OMX_VIDEO_AVCLevel41:
@@ -2013,17 +2312,17 @@ static void* ComponentThread(void* pThreadData)
 										memset(&sps_pps_info, 0, sizeof(ENCEXTRADATAINFO_t));
 
 										ALOGD(" init format,width: %d, height: %d, bitrate: %d", width, height, bitrate);
-										
+
 										if (ve_mutex_lock(&pSelf->m_cedarv_req_ctx) < 0) {
-										
+
 											ALOGE("can not get ve resource");
 											goto EXIT;
 										}
-	
+
 										pSelf->m_encoder = CedarvEncInit(pSelf->m_sInPortDef.format.video.nFrameWidth, pSelf->m_sInPortDef.format.video.nFrameHeight, bitrate, pSelf->m_framerate, level);
 
 										ve_mutex_unlock(&pSelf->m_cedarv_req_ctx);
-										
+
 										if(pSelf->m_encoder == NULL)
 										{
 											ALOGE("can not create video encoder.");
@@ -2037,7 +2336,7 @@ static void* ComponentThread(void* pThreadData)
 										if(sps_pps_info.data == NULL)
 										{
 											ALOGE("can not get sps pps info");
-									    	goto EXIT;										
+									    	goto EXIT;
 										}
 
 										pSelf->m_pExtraData = (unsigned char *)malloc(sps_pps_info.length);
@@ -2049,7 +2348,7 @@ static void* ComponentThread(void* pThreadData)
 										}
 
 										pSelf->m_extraDataLength = sps_pps_info.length;
-										memcpy(pSelf->m_pExtraData, sps_pps_info.data, sps_pps_info.length);	
+										memcpy(pSelf->m_pExtraData, sps_pps_info.data, sps_pps_info.length);
 
 										pSelf->m_firstFrameFlag = OMX_TRUE;
 									}
@@ -2062,7 +2361,7 @@ static void* ComponentThread(void* pThreadData)
 			                    nTimeout = 0x0;
 			                    while (1)
 			                    {
-			                    	ALOGD("pSelf->m_sInPortDef.bPopulated:%d, pSelf->m_sOutPortDef.bPopulated: %d", pSelf->m_sInPortDef.bPopulated, pSelf->m_sOutPortDef.bPopulated);
+			                    	ALOGV("pSelf->m_sInPortDef.bPopulated:%d, pSelf->m_sOutPortDef.bPopulated: %d", pSelf->m_sInPortDef.bPopulated, pSelf->m_sOutPortDef.bPopulated);
 			                        // Ports have to be populated before transition completes
 			                        if ((!pSelf->m_sInPortDef.bEnabled && !pSelf->m_sOutPortDef.bEnabled)   ||
                                         (pSelf->m_sInPortDef.bPopulated && pSelf->m_sOutPortDef.bPopulated))
@@ -2088,6 +2387,40 @@ static void* ComponentThread(void* pThreadData)
 		                    break;
 
 		                case OMX_StateExecuting:
+
+							pSelf->m_input_buffer_info.size_Y = pSelf->m_sInPortDef.format.video.nFrameWidth*pSelf->m_sInPortDef.format.video.nFrameHeight;
+							pSelf->m_input_buffer_info.size_C = pSelf->m_input_buffer_info.size_Y>>1;
+
+#if 0 //* commended by chenxiaochuan. because encoder can not transform bt601 to yuv correctly, so we need a buffer to transfrom manually and specific that it is a yuv buffer for encoder.
+							if(pSelf->m_sInPortFormat.eColorFormat == OMX_COLOR_FormatAndroidOpaque)
+							{
+								ALOGD("pSelf->m_sInPortFormat.eColorFormat == OMX_COLOR_FormatAndroidOpaque");
+							}
+							else
+#endif //* commended by chenxiaochuan.
+							{
+								if(pSelf->m_input_buffer_vir  == NULL)
+								{
+								#if 0 //* allocate large buffer for pixel transfrom.
+									pSelf->m_input_buffer_vir = (OMX_U8 *)cedar_sys_phymalloc_map(pSelf->m_sInPortDef.format.video.nFrameWidth*pSelf->m_sInPortDef.format.video.nFrameHeight*3/2,1024);
+								#else
+									ALOGV("l:%d  w:%d h:%d",__LINE__,pSelf->m_sInPortDef.format.video.nFrameWidth,pSelf->m_sInPortDef.format.video.nFrameHeight);
+									pSelf->m_input_buffer_vir = (OMX_U8 *)cedar_sys_phymalloc_map(pSelf->m_sInPortDef.format.video.nFrameWidth*pSelf->m_sInPortDef.format.video.nFrameHeight*4,1024);
+								#endif
+									pSelf->m_input_buffer_phy= (OMX_U8 *)cedarv_address_vir2phy(pSelf->m_input_buffer_vir);
+								}
+
+								if(pSelf->m_input_buffer_vir == NULL)
+								{
+									ALOGE("palloc m_input_buffer_vir memory error");
+								}
+
+								pSelf->m_input_buffer_info.pBufY = pSelf->m_input_buffer_vir;
+								pSelf->m_input_buffer_info.pBufC = pSelf->m_input_buffer_vir + pSelf->m_input_buffer_info.size_Y;
+								pSelf->m_input_buffer_info.phy_y = pSelf->m_input_buffer_phy;
+								pSelf->m_input_buffer_info.phy_c = pSelf->m_input_buffer_phy + pSelf->m_input_buffer_info.size_Y;
+							}
+
                             // Transition can only happen from pause or idle state
                             if (pSelf->m_state == OMX_StateIdle || pSelf->m_state == OMX_StatePause)
                             {
@@ -2095,7 +2428,7 @@ static void* ComponentThread(void* pThreadData)
 			                    if (pSelf->m_state == OMX_StatePause)
 			                    {
 			                    	ALOGE("encode component do not support OMX_StatePause");
-									
+
 			                    	pthread_mutex_lock(&pSelf->m_inBufMutex);
 
                                     while (pSelf->m_sInBufList.nSizeOfList > 0)
@@ -2133,7 +2466,7 @@ static void* ComponentThread(void* pThreadData)
 			                else
 			                	pSelf->m_Callbacks.EventHandler(&pSelf->m_cmp, pSelf->m_pAppData, OMX_EventError, OMX_ErrorIncorrectStateTransition, 0 , NULL);
 
-                            eos                  = OMX_FALSE; //if need it
+                            nInBufEos            = OMX_FALSE; //if need it
                             pMarkData            = NULL;
                             hMarkTargetComponent = NULL;
 
@@ -2364,12 +2697,14 @@ static void* ComponentThread(void* pThreadData)
 	        }
 	        else if (cmd == FillBuf)
 	        {
+	        	ALOGV("LINE %d", __LINE__);
+	        	OMX_BUFFERHEADERTYPE*   OutBufHdr  = NULL;
 	            // Fill buffer
 	        	pthread_mutex_lock(&pSelf->m_outBufMutex);
 	        	if (pSelf->m_sOutBufList.nSizeOfList <= pSelf->m_sOutBufList.nAllocSize)
 	        	{
 	        		pSelf->m_sOutBufList.nSizeOfList++;
-	        		pSelf->m_sOutBufList.pBufHdrList[pSelf->m_sOutBufList.nWritePos++] = ((OMX_BUFFERHEADERTYPE*) cmddata);
+	        		OutBufHdr = pSelf->m_sOutBufList.pBufHdrList[pSelf->m_sOutBufList.nWritePos++] = ((OMX_BUFFERHEADERTYPE*) cmddata);
 
 	                if (pSelf->m_sOutBufList.nWritePos >= (int)pSelf->m_sOutBufList.nAllocSize)
 	                	pSelf->m_sOutBufList.nWritePos = 0;
@@ -2378,12 +2713,15 @@ static void* ComponentThread(void* pThreadData)
             }
 	        else if (cmd == EmptyBuf)
 	        {
+	        	ALOGV("LINE %d", __LINE__);
+	        	OMX_BUFFERHEADERTYPE*   inBufHdr  = NULL;
+
 	            // Empty buffer
 	    	    pthread_mutex_lock(&pSelf->m_inBufMutex);
 	        	if (pSelf->m_sInBufList.nSizeOfList <= pSelf->m_sInBufList.nAllocSize)
 	        	{
 	        		pSelf->m_sInBufList.nSizeOfList++;
-	        		pSelf->m_sInBufList.pBufHdrList[pSelf->m_sInBufList.nWritePos++] = ((OMX_BUFFERHEADERTYPE*) cmddata);
+	        		inBufHdr = pSelf->m_sInBufList.pBufHdrList[pSelf->m_sInBufList.nWritePos++] = ((OMX_BUFFERHEADERTYPE*) cmddata);
 
 	                if (pSelf->m_sInBufList.nWritePos >= (int)pSelf->m_sInBufList.nAllocSize)
 	                	pSelf->m_sInBufList.nWritePos = 0;
@@ -2411,7 +2749,47 @@ static void* ComponentThread(void* pThreadData)
         	pSelf->m_sOutPortDef.bEnabled         &&
         	port_setting_match)
         {
-			
+
+			if (nInBufEos) {
+				ALOGV("before nInBufEos pOutBufHdr %p, pSelf->m_sOutBufList.nSizeOfList %d", pOutBufHdr, pSelf->m_sOutBufList.nSizeOfList);
+
+				pthread_mutex_lock(&pSelf->m_outBufMutex);
+
+				if(pSelf->m_sOutBufList.nSizeOfList > 0)
+				{
+					pSelf->m_sOutBufList.nSizeOfList--;
+					pOutBufHdr = pSelf->m_sOutBufList.pBufHdrList[pSelf->m_sOutBufList.nReadPos++];
+					if (pSelf->m_sOutBufList.nReadPos >= (int)pSelf->m_sOutBufList.nAllocSize)
+						pSelf->m_sOutBufList.nReadPos = 0;
+				}
+				else
+				{
+					//ALOGV("NO output bitstream !!!");
+					pOutBufHdr = NULL;
+				}
+
+				pthread_mutex_unlock(&pSelf->m_outBufMutex);
+
+				ALOGV("after nInBufEos pOutBufHdr %p, pSelf->m_sOutBufList.nSizeOfList %d", pOutBufHdr, pSelf->m_sOutBufList.nSizeOfList);
+
+				//* if no output buffer, wait for some time.
+				if(pOutBufHdr == NULL)
+				{
+					usleep(10*1000);
+					ALOGV("1 no output frame,wait 10ms");
+					continue;
+				}
+
+				pOutBufHdr->nFlags &= ~OMX_BUFFERFLAG_CODECCONFIG;
+				pOutBufHdr->nFlags &= ~OMX_BUFFERFLAG_SYNCFRAME;
+
+				pOutBufHdr->nFlags |= OMX_BUFFERFLAG_EOS;
+				pOutBufHdr->nFilledLen = 0;
+
+				pSelf->m_Callbacks.FillBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pOutBufHdr);
+				pOutBufHdr = NULL;
+			}
+
         	//* 1. check if there is bitstream to output.
         	if(pSelf->m_encoder->hasOutputStream(pSelf->m_encoder))
         	{
@@ -2439,7 +2817,7 @@ static void* ComponentThread(void* pThreadData)
                     ALOGV("no output frame,wait 10ms");
             		continue;
             	}
-				
+
 				pOutBufHdr->nFlags &= ~OMX_BUFFERFLAG_CODECCONFIG;
 				pOutBufHdr->nFlags &= ~OMX_BUFFERFLAG_SYNCFRAME;
 
@@ -2448,6 +2826,12 @@ static void* ComponentThread(void* pThreadData)
 					pOutBufHdr->nTimeStamp = 0; //fixed it later;
 					pOutBufHdr->nFilledLen = pSelf->m_extraDataLength;
 					pOutBufHdr->nOffset = 0;
+#if SAVE_FILE
+					if(fpOutput)
+					{
+						fwrite(pSelf->m_pExtraData, 1, pOutBufHdr->nFilledLen, fpOutput);
+					}
+#endif
 					memcpy(pOutBufHdr->pBuffer, pSelf->m_pExtraData, pOutBufHdr->nFilledLen);
                     pSelf->m_firstFrameFlag = OMX_FALSE;
 
@@ -2455,30 +2839,56 @@ static void* ComponentThread(void* pThreadData)
 					//pOutBufHdr->nFlags |= OMX_BUFFERFLAG_SYNCFRAME;
 
 				    pSelf->m_Callbacks.FillBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pOutBufHdr);
-	                pOutBufHdr = NULL;	
-						
+	                pOutBufHdr = NULL;
+
 		            continue;
 				}
 				else
-				{
+				{
 				  	memset(&pSelf->m_datainfo, 0, sizeof(__vbv_data_ctrl_info_t));
 	            	pSelf->m_encoder->GetBitStreamInfo(pSelf->m_encoder, &pSelf->m_datainfo);
-	            	
+
 	            	pOutBufHdr->nTimeStamp = pSelf->m_datainfo.pts; //fix it, add base pts
 	            	pOutBufHdr->nFilledLen = pSelf->m_datainfo.uSize0 + pSelf->m_datainfo.uSize1;
 				    pOutBufHdr->nOffset = 0;
 
 					pOutBufHdr->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+
 					if(pSelf->m_datainfo.keyFrameFlag)
 					{
 						pOutBufHdr->nFlags |= OMX_BUFFERFLAG_SYNCFRAME;
+					}
 
+					if(pSelf->m_prependSPSPPSToIDRFrames == OMX_TRUE && pSelf->m_datainfo.keyFrameFlag)
+					{
+						pOutBufHdr->nFilledLen += pSelf->m_extraDataLength;
+
+						memcpy(pOutBufHdr->pBuffer, pSelf->m_pExtraData, pSelf->m_extraDataLength);
+						memcpy(pOutBufHdr->pBuffer + pSelf->m_extraDataLength, pSelf->m_datainfo.pData0, pSelf->m_datainfo.uSize0);
+						if(pSelf->m_datainfo.uSize1){
+							memcpy(pOutBufHdr->pBuffer + pSelf->m_extraDataLength + pSelf->m_datainfo.uSize0, pSelf->m_datainfo.pData1, pSelf->m_datainfo.uSize1);
+						}
 					}
-
-            		memcpy(pOutBufHdr->pBuffer, pSelf->m_datainfo.pData0, pSelf->m_datainfo.uSize0);
-					if(pSelf->m_datainfo.uSize1){
-						memcpy(pOutBufHdr->pBuffer + pSelf->m_datainfo.uSize0, pSelf->m_datainfo.pData1, pSelf->m_datainfo.uSize1);
+					else
+					{
+#if SAVE_FILE
+						if(fpOutput)
+						{
+							fwrite(pSelf->m_datainfo.pData0, 1, pSelf->m_datainfo.uSize0, fpOutput);
+						}
+#endif
+						memcpy(pOutBufHdr->pBuffer, pSelf->m_datainfo.pData0, pSelf->m_datainfo.uSize0);
+						if(pSelf->m_datainfo.uSize1){
+#if SAVE_FILE
+							if(fpOutput)
+							{
+								fwrite(pSelf->m_datainfo.pData1, 1, pSelf->m_datainfo.uSize1, fpOutput);
+							}
+#endif
+							memcpy(pOutBufHdr->pBuffer + pSelf->m_datainfo.uSize0, pSelf->m_datainfo.pData1, pSelf->m_datainfo.uSize1);
+						}
 					}
+
 
 	                pSelf->m_encoder->ReleaseBitStreamInfo(pSelf->m_encoder, pSelf->m_datainfo.idx);
 
@@ -2496,26 +2906,19 @@ static void* ComponentThread(void* pThreadData)
 	                		hMarkTargetComponent = NULL;
 	                	}
 	 		        }
-	                //ALOGV("FillBufferDone is called");
+	                ALOGV("FillBufferDone is called,  pOutBufHdr->nTimeStamp %lld", pOutBufHdr->nTimeStamp);
 	                pSelf->m_Callbacks.FillBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pOutBufHdr);
-	                pOutBufHdr = NULL;	
+	                pOutBufHdr = NULL;
 				}
 
                 continue;
         	}
         	else
         	{
-        		unsigned int size_Y;
-				unsigned int size_C;
-		        unsigned char* pBufY;
-            	unsigned char* pBufC;
-				unsigned int phy_y;
-				unsigned int phy_c;
-		
 				if(pSelf->m_input_step == STEP_QEQUEST_INPUT_BUFFER)
 				{
 					pInBufHdr = NULL;
-					
+
 					//* check if there is a input picture.
 	                pthread_mutex_lock(&pSelf->m_inBufMutex);
 
@@ -2525,6 +2928,9 @@ static void* ComponentThread(void* pThreadData)
 	                	pInBufHdr = pSelf->m_sInBufList.pBufHdrList[pSelf->m_sInBufList.nReadPos++];
 	                	if (pSelf->m_sInBufList.nReadPos >= (int)pSelf->m_sInBufList.nAllocSize)
 	                		pSelf->m_sInBufList.nReadPos = 0;
+
+	                	ALOGV("%d, pInBufHdr->nTimeStamp %lld, pSelf->m_sInBufList.nReadPos %d", __LINE__, pInBufHdr->nTimeStamp, pSelf->m_sInBufList.nReadPos);
+
 	                }
 
 	                pthread_mutex_unlock(&pSelf->m_inBufMutex);
@@ -2539,6 +2945,20 @@ static void* ComponentThread(void* pThreadData)
 
 					if (pInBufHdr)
 					{
+						if (pInBufHdr->nFlags & OMX_BUFFERFLAG_EOS)
+						{
+							// Copy flag to output buffer header
+							nInBufEos = OMX_TRUE;
+
+							ALOGD(" set up nInBufEos flag.");
+
+							// Trigger event handler
+							pSelf->m_Callbacks.EventHandler(&pSelf->m_cmp, pSelf->m_pAppData, OMX_EventBufferFlag, 0x1, pInBufHdr->nFlags, NULL);
+
+							// Clear flag
+							pInBufHdr->nFlags = 0;
+
+						}
 						// Check for mark buffers
 						if (pInBufHdr->pMarkData)
 						{
@@ -2550,29 +2970,148 @@ static void* ComponentThread(void* pThreadData)
 								hMarkTargetComponent = pInBufHdr->hMarkTargetComponent;
 							}
 						}
-					
+
 						// Trigger event handler
 						if (pInBufHdr->hMarkTargetComponent == &pSelf->m_cmp && pInBufHdr->pMarkData)
 							pSelf->m_Callbacks.EventHandler(&pSelf->m_cmp, pSelf->m_pAppData, OMX_EventMark, 0, 0, pInBufHdr->pMarkData);
 					}
 
 					// *reqest inputbuffer;
-	                pSelf->m_encoder->RequestBuffer(pSelf->m_encoder, &pBufY, &pBufC, &phy_y, &phy_c);
+	                //pSelf->m_encoder->RequestBuffer(pSelf->m_encoder, &pBufY, &pBufC, &phy_y, &phy_c);
 
 					// *add stream to encode;
-					size_Y = pSelf->m_sInPortDef.format.video.nFrameWidth*pSelf->m_sInPortDef.format.video.nFrameHeight;
-					size_C = size_Y>>1;
-					
-					memcpy(pBufY, pInBufHdr->pBuffer + pInBufHdr->nOffset,size_Y);
-					memcpy(pBufC, pInBufHdr->pBuffer + pInBufHdr->nOffset + size_Y,size_C);
+					if(pSelf->m_useMetaDataInBuffers)
+					{
+						int buffer_type =  *(int*)(pInBufHdr->pBuffer+pInBufHdr->nOffset);
+				        if( buffer_type != 1)
+				        {
+				        	ALOGW("skip this input buffer, pInBufHdr->nTimeStamp %lld", pInBufHdr->nTimeStamp);
+				        	pSelf->m_Callbacks.EmptyBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pInBufHdr);
+				        	pInBufHdr = NULL;
+				        	continue;
+				        }
 
-					pSelf->m_encoder->UpdataBuffer(pSelf->m_encoder);
+						pSelf->m_input_buffer_info.buffer_point = (unsigned char *)((pInBufHdr->pBuffer+pInBufHdr->nOffset) + 4);
+					}
+					else
+					{
+						pSelf->m_input_buffer_info.buffer_point = (unsigned char *)(pInBufHdr->pBuffer+pInBufHdr->nOffset);
+					}
 
-				 	pSelf->m_Callbacks.EmptyBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pInBufHdr);
+					if(pSelf->m_useAndroidBuffer)
+					{
+						if(pSelf->mIsFromCts == false)
+						{
+						int res;
+						void *PhyAddr;
+						unsigned int phyaddress = 0;
+
+						if(pSelf->m_sInPortFormat.eColorFormat != OMX_COLOR_FormatAndroidOpaque) {
+							ALOGE("do not support this format: %d", pSelf->m_sInPortFormat.eColorFormat);
+						}
+
+						pSelf->m_input_buffer_info.imgBuffer = *(buffer_handle_t*)(pSelf->m_input_buffer_info.buffer_point);
+						const Rect rect(pSelf->m_sInPortDef.format.video.nFrameWidth, pSelf->m_sInPortDef.format.video.nFrameHeight);
+						unsigned char *img;
+
+						int fd =-1;
+						unsigned int phy_adr = 0;
+						struct ion_handle *handle_ion;
+						private_handle_t* hnd = NULL;
+						fd = ion_open();
+						if( fd != -1 )
+						{
+							if (private_handle_t::validate(pSelf->m_input_buffer_info.imgBuffer) < 0)
+							{
+								ALOGE("Locking invalid buffer returning error");
+							}
+							else
+							{
+								hnd = (private_handle_t*)(pSelf->m_input_buffer_info.imgBuffer);
+								ion_import(fd,hnd->share_fd, &handle_ion);
+									phy_adr= (unsigned int)ion_getphyadr(fd,(void *)(handle_ion));
+									phyaddress = phy_adr;
+									//ALOGD("++++++++phyaddress: %d\n", phyaddress);
+							}
+								ion_close(fd);
+						}
+
+
+						if(phyaddress >= 0x40000000)
+							phyaddress -= 0x40000000;
+
+						ALOGV("phyaddress: %d", phyaddress);
+						pSelf->m_input_buffer_info.phy_y  = (unsigned char *)phyaddress;
+						}
+						else
+						{
+							void* bufAddr;
+//							unsigned char* tmpAddr;
+							RGBPIX* rgb_pix;
+							int width;
+							int height;
+
+							//* get the argb buffer.
+							pSelf->m_input_buffer_info.imgBuffer = *(buffer_handle_t*)(pSelf->m_input_buffer_info.buffer_point);
+	                    	android::Rect r(pSelf->m_sInPortDef.format.video.nFrameWidth, pSelf->m_sInPortDef.format.video.nFrameHeight);
+							GraphicBufferMapper::get().lock(pSelf->m_input_buffer_info.imgBuffer, GRALLOC_USAGE_HW_VIDEO_ENCODER | GRALLOC_USAGE_SW_WRITE_OFTEN, r, &bufAddr);
+							rgb_pix = (RGBPIX*)bufAddr;
+							width = pSelf->m_sInPortDef.format.video.nFrameWidth;
+							height = pSelf->m_sInPortDef.format.video.nFrameHeight;
+
+//							tmpAddr = pSelf->m_input_buffer_info.pBufY + width*height*3;
+
+#if SAVE_FILE
+							if(rgb) {
+								fseek(rgb, 0, SEEK_SET);
+								fwrite(bufAddr, 1, width * height * 4, rgb);
+							}
+#endif
+
+
+							if(width % 16 == 0)
+							{
+								//rgb2yuv_fixpoint(rgb_pix, pSelf->m_input_buffer_info.pBufY, tmpAddr, width, height, width, 0);
+								int widthandstride[2];
+								widthandstride[0] = width;
+								widthandstride[1] = width;
+								Img_real_RGBA2YUV420SP_neon((unsigned char *)rgb_pix, pSelf->m_input_buffer_info.pBufY, widthandstride, height);
+							}
+							else
+							{
+								//rgb2yuv_fixpoint(rgb_pix, pSelf->m_input_buffer_info.pBufY, tmpAddr, width, height, ((width + 32) & (~31)), 0);
+								int widthandstride[2];
+								widthandstride[0] = width;
+								widthandstride[1] = (width + 16) & (~15);
+								Img_real_RGBA2YUV420SP_neon((unsigned char *)rgb_pix, pSelf->m_input_buffer_info.pBufY, widthandstride, height);
+							}
+
+							
+							cedarx_cache_op((long)pSelf->m_input_buffer_info.pBufY, (long)(pSelf->m_input_buffer_info.pBufY + pSelf->m_input_buffer_info.size_Y + pSelf->m_input_buffer_info.size_C), 0);
+#if SAVE_FILE
+							if(fpInput) {
+								if (pSelf->m_input_buffer_info.pBufY) {
+									fseek(fpInput,0,SEEK_SET);
+									fwrite(pSelf->m_input_buffer_info.pBufY, 1, width * height * 1.5, fpInput);
+								}
+							}
+#endif
+							GraphicBufferMapper::get().unlock(pSelf->m_input_buffer_info.imgBuffer);
+						}
+					}
+					else
+					{
+						memcpy(pSelf->m_input_buffer_info.pBufY, pSelf->m_input_buffer_info.buffer_point,pSelf->m_input_buffer_info.size_Y);
+						memcpy(pSelf->m_input_buffer_info.pBufC, pSelf->m_input_buffer_info.buffer_point + pSelf->m_input_buffer_info.size_Y,pSelf->m_input_buffer_info.size_C);
+						cedarx_cache_op((long)pSelf->m_input_buffer_info.pBufY, (long)(pSelf->m_input_buffer_info.pBufY + pSelf->m_input_buffer_info.size_Y + pSelf->m_input_buffer_info.size_C), 0);
+				 		//pSelf->m_Callbacks.EmptyBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pInBufHdr);
+					}
+
+					// pSelf->m_encoder->UpdataBuffer(pSelf->m_encoder);
 
 					memset(&pSelf->m_encBuf, 0, sizeof(VEnc_FrmBuf_Info));
-					pSelf->m_encBuf.addrY = (unsigned char *)phy_y;
-					pSelf->m_encBuf.addrCb = (unsigned char *)phy_c;
+					pSelf->m_encBuf.addrY = (unsigned char *)pSelf->m_input_buffer_info.phy_y;
+					pSelf->m_encBuf.addrCb = (unsigned char *)pSelf->m_input_buffer_info.phy_c;
 
 					pSelf->m_input_step = STEP_ENCODE;
 				}
@@ -2584,24 +3123,67 @@ static void* ComponentThread(void* pThreadData)
 						usleep(5*1000);
 						continue;
 					}
-					
+
 					pSelf->m_encBuf.addrCr = 0;
 					pSelf->m_encBuf.pts_valid = 1;
 					pSelf->m_encBuf.pts = pInBufHdr->nTimeStamp;
 					pSelf->m_encBuf.pover_overlay = NULL;
-					pSelf->m_encBuf.color_fmt = PIXEL_YUV420;
+
+					if(pSelf->mIsFromCts == false)
+					{
+						if(pSelf->m_sInPortFormat.eColorFormat == OMX_COLOR_FormatAndroidOpaque)
+						{
+							pSelf->m_encBuf.color_fmt = PIXEL_CSIABGR;
+						}
+						else
+						{
+						  	pSelf->m_encBuf.color_fmt = PIXEL_YUV420;	
+						}
+					}
+					else
+					{
+					  	pSelf->m_encBuf.color_fmt = PIXEL_YUV420;
+					}
+
 					pSelf->m_encBuf.color_space = BT601;
+
+					pthread_mutex_lock(&pSelf->m_bitrateMutex);
+					pSelf->m_encoder->IoCtrl(pSelf->m_encoder, VENC_SET_BITRATE_CMD, (unsigned int)pSelf->m_sOutPortDef.format.video.nBitrate);
+					pthread_mutex_unlock(&pSelf->m_bitrateMutex);
+
+					if(pSelf->mIsFromCts == false)
+					{
+						if(pSelf->m_useAndroidBuffer)
+						{
+							Rect r(0, 0, 1, 1);
+							GraphicBufferMapper::get().lock(pSelf->m_input_buffer_info.imgBuffer, GRALLOC_USAGE_HW_VIDEO_ENCODER, r, NULL);
+						}
+					}
 
 					encodeResult = pSelf->m_encoder->encode(pSelf->m_encoder, &pSelf->m_encBuf);
 
+					if(pSelf->mIsFromCts == false)
+					{
+						if(pSelf->m_useAndroidBuffer)
+						{
+							GraphicBufferMapper::get().unlock(pSelf->m_input_buffer_info.imgBuffer);
+						}
+					}
+
 					ve_mutex_unlock(&pSelf->m_cedarv_req_ctx);
 
+					//if(pSelf->m_useAndroidBuffer)
+					//{
+						//ALOGD("###[star] EmptyBufferDone: pInBufHdr=%p", pInBufHdr);
+				    pSelf->m_Callbacks.EmptyBufferDone(&pSelf->m_cmp, pSelf->m_pAppData, pInBufHdr);
+					//}
+
 					pSelf->m_input_step = STEP_QEQUEST_INPUT_BUFFER;
-					
+
 	    			if(encodeResult < 0)
 	    			{
 	                    ALOGE("encode fatal error[%d]", encodeResult);
-						
+
 	    				//* report a fatal error.
 	                    pSelf->m_Callbacks.EventHandler(&pSelf->m_cmp, pSelf->m_pAppData, OMX_EventError, OMX_ErrorHardware, 0, NULL);
 	                    continue;
@@ -2612,7 +3194,16 @@ static void* ComponentThread(void* pThreadData)
     }
 
 EXIT:
-    return (void*)OMX_ErrorNone;
+
+#if SAVE_FILE
+	if(fpInput)
+		fclose(fpInput);
+	if(rgb)
+		fclose(rgb);
+	if(fpOutput)
+		fclose(fpOutput);
+#endif
+	return (void*)OMX_ErrorNone;
 }
 
 

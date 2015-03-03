@@ -8,9 +8,12 @@
 extern "C" {
 #endif
 
+#define ADAPT_A10_GPU_RENDER (1)
 extern unsigned int cedarv_address_vir2phy(void *addr);
 extern unsigned int cedarv_address_phy2vir(void *addr);
 void TransformToYUVPlaner(cedarv_picture_t* pict, void* ybuf);
+void TransformToGPUBuffer(cedarv_picture_t* pict, void* ybuf);
+void TransformToVirtualBuffer(cedarv_picture_t* pict, void* ybuf);
 
 #ifdef __cplusplus
 }

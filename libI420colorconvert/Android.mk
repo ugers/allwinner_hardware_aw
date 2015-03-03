@@ -6,9 +6,8 @@ LOCAL_SRC_FILES := \
     ColorConvert.cpp
 
 LOCAL_C_INCLUDES:= \
-        $(TOP)/hardware/aw/omxcore/inc \
+        $(TOP)/frameworks/native/include/media/openmax \
         $(TOP)/frameworks/native/include/media/editor
-        
 
 LOCAL_SHARED_LIBRARIES :=\
     libutils \
