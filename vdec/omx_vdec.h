@@ -61,7 +61,7 @@ typedef enum ThrCmdType
 #define NUM_OUT_BUFFERS                 2       	// Output Buffers
 #define OMX_TIMEOUT                     10          // Timeout value in milisecond
 #define OMX_MAX_TIMEOUTS                160   		// Count of Maximum number of times the component can time out
-#define OMX_VIDEO_DEC_INPUT_BUFFER_SIZE (128*1024)
+#define OMX_VIDEO_DEC_INPUT_BUFFER_SIZE (2*1024*1024)
 
 #define AWOMX_PTS_JUMP_THRESH             (2000000)   //pts jump threshold to judge, unit:us
 /*
